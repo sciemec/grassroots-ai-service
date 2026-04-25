@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: grassroots-ai-tracker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard          # 2 CPU / 4 GB RAM — needed for YOLOv8 + OpenCV
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000

@@ -21,7 +21,10 @@ import tempfile
 from collections import defaultdict
 from typing import Any, Optional
 
+import time
+
 import cv2
+import httpx
 import numpy as np
 import supervision as sv
 import uvicorn
@@ -40,6 +43,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://grassrootssports.live",
+        "https://www.grassrootssports.live",
         "http://localhost:3000",
         "http://localhost:3001",
     ],
@@ -479,6 +483,63 @@ def _run_tracking(video_path: str, squad_map: dict[str, str]) -> dict[str, Any]:
             "total_frames": total_frames,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Gemini File API proxy (browser cannot call Google directly due to CORS)
+# ---------------------------------------------------------------------------
+
+@app.post("/gemini-upload")
+async def gemini_upload(file: UploadFile = File(...)) -> dict[str, Any]:
+    google_key = os.environ.get("GOOGLE_AI_API_KEY")
+    if not google_key:
+        raise HTTPException(status_code=500, detail="GOOGLE_AI_API_KEY not configured on AI service")
+
+    content = await file.read()
+    mime_type = file.content_type or "video/mp4"
+    content_length = len(content)
+
+    timeout = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Start resumable upload session
+        init_res = await client.post(
+            f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={google_key}",
+            headers={
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(content_length),
+                "X-Goog-Upload-Header-Content-Type": mime_type,
+                "Content-Type": "application/json",
+            },
+            json={"file": {"display_name": f"match-{int(time.time())}"}},
+        )
+        if init_res.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"Gemini session init failed: {init_res.status_code}")
+
+        upload_url = init_res.headers.get("X-Goog-Upload-URL")
+        if not upload_url:
+            raise HTTPException(status_code=502, detail="Gemini did not return upload URL")
+
+        # Upload video bytes to Google
+        upload_res = await client.put(
+            upload_url,
+            headers={
+                "Content-Length": str(content_length),
+                "X-Goog-Upload-Offset": "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            },
+            content=content,
+        )
+        if upload_res.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"Gemini upload failed: {upload_res.status_code}")
+
+        file_info = upload_res.json().get("file", {})
+        return {
+            "fileUri":  file_info.get("uri", ""),
+            "fileName": file_info.get("name", ""),
+            "mimeType": file_info.get("mimeType", mime_type),
+            "state":    file_info.get("state", "ACTIVE"),
+        }
 
 
 # ---------------------------------------------------------------------------

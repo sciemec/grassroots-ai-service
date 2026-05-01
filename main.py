@@ -19,6 +19,7 @@ import json
 import os
 import tempfile
 from collections import defaultdict
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import time
@@ -74,7 +75,7 @@ SAMPLE_FPS = 1
 PERSON_CLASS_ID = 0
 BALL_CLASS_ID = 32  # COCO sports ball class
 
-TRACKER_CONFIG = sv.ByteTrackerArgs(
+TRACKER_CONFIG = SimpleNamespace(
     track_activation_threshold=0.25,
     lost_track_buffer=50,
     minimum_matching_threshold=0.8,

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 from collections import defaultdict
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from typing import Any, Optional
 
 import time
 
+import boto3
 import cv2
 import httpx
 import numpy as np
@@ -541,6 +543,196 @@ async def gemini_upload(file: UploadFile = File(...)) -> dict[str, Any]:
             "mimeType": file_info.get("mimeType", mime_type),
             "state":    file_info.get("state", "ACTIVE"),
         }
+
+
+# ---------------------------------------------------------------------------
+# Sprint event detection
+# ---------------------------------------------------------------------------
+
+SPRINT_THRESHOLD_KMH = 25.0
+
+
+def detect_sprint_events(
+    players: list[dict[str, Any]],
+    threshold_kmh: float = SPRINT_THRESHOLD_KMH,
+) -> list[dict[str, Any]]:
+    """
+    Scan per-player position data and return sprint moments.
+    A sprint = any second where the player's speed exceeds threshold_kmh.
+    Output: [{player_id, name, team, second, speed_kmh}]
+    """
+    events: list[dict[str, Any]] = []
+    for player in players:
+        positions = player.get("positions", [])
+        for i in range(1, len(positions)):
+            prev = positions[i - 1]
+            curr = positions[i]
+            dx = (curr["x"] - prev["x"]) * PITCH_LENGTH_M
+            dy = (curr["y"] - prev["y"]) * PITCH_WIDTH_M
+            speed_kmh = ((dx**2 + dy**2) ** 0.5) * 3.6
+            if speed_kmh >= threshold_kmh:
+                events.append({
+                    "player_id": player["id"],
+                    "name": player.get("name", ""),
+                    "team": player.get("team", "home"),
+                    "second": curr["second"],
+                    "speed_kmh": round(speed_kmh, 1),
+                })
+
+    events.sort(key=lambda e: e["speed_kmh"], reverse=True)  # fastest first
+    return events
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg clip cutter
+# ---------------------------------------------------------------------------
+
+def clip_highlights(
+    video_path: str,
+    events: list[dict[str, Any]],
+    padding_s: int = 5,
+    max_clips: int = 10,
+) -> list[dict[str, Any]]:
+    """
+    For each sprint event, cut ±padding_s seconds of video using ffmpeg.
+    Skips events whose time window overlaps a clip already cut.
+    Returns [{event, clip_path, start, end}].
+    """
+    clips: list[dict[str, Any]] = []
+    seen_windows: list[tuple[int, int]] = []
+
+    for event in events:
+        if len(clips) >= max_clips:
+            break
+
+        second = event["second"]
+        start = max(0, second - padding_s)
+        end = second + padding_s
+
+        # Skip overlapping window
+        if any(not (end <= s or start >= e) for s, e in seen_windows):
+            continue
+
+        seen_windows.append((start, end))
+        out_path = tempfile.mktemp(suffix=".mp4")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start),
+            "-i", video_path,
+            "-t", str(end - start),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            out_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        if result.returncode == 0:
+            clips.append({"event": event, "clip_path": out_path, "start": start, "end": end})
+
+    return clips
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare R2 uploader
+# ---------------------------------------------------------------------------
+
+def upload_clips_to_r2(clips: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Upload each clip to Cloudflare R2 (S3-compatible).
+    If R2 env vars are not set, returns empty url (dev mode).
+    Always deletes the local temp file after upload attempt.
+    Returns [{event, url, key}].
+    """
+    r2_account = os.environ.get("R2_ACCOUNT_ID")
+    r2_key = os.environ.get("R2_ACCESS_KEY_ID")
+    r2_secret = os.environ.get("R2_SECRET_ACCESS_KEY")
+    r2_bucket = os.environ.get("R2_BUCKET", "grassroots-videos")
+    r2_public = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
+
+    s3_client = None
+    if all([r2_account, r2_key, r2_secret]):
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{r2_account}.r2.cloudflarestorage.com",
+            aws_access_key_id=r2_key,
+            aws_secret_access_key=r2_secret,
+            region_name="auto",
+        )
+
+    results: list[dict[str, Any]] = []
+    for clip in clips:
+        key = f"highlights/{int(time.time())}-p{clip['event']['player_id']}-{clip['start']}s.mp4"
+        url = ""
+        try:
+            if s3_client:
+                s3_client.upload_file(
+                    clip["clip_path"],
+                    r2_bucket,
+                    key,
+                    ExtraArgs={"ContentType": "video/mp4"},
+                )
+                url = f"{r2_public}/{key}" if r2_public else ""
+        except Exception:
+            url = ""
+        finally:
+            try:
+                os.unlink(clip["clip_path"])
+            except OSError:
+                pass
+        results.append({"event": clip["event"], "url": url, "key": key})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Highlight clip endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/clip")
+async def clip_video(
+    file: UploadFile = File(...),
+    squad: Optional[str] = Form(None),
+    threshold_kmh: float = Form(25.0),
+    max_clips: int = Form(10),
+) -> dict[str, Any]:
+    """
+    Run player tracking, detect sprint events above threshold_kmh,
+    cut highlight clips with ffmpeg, upload to R2.
+
+    Returns: { clips, events_detected, clips_generated, stats }
+    """
+    if file.content_type and not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="File must be a video")
+
+    squad_map: dict[str, str] = {}
+    if squad:
+        try:
+            squad_map = json.loads(squad)
+        except json.JSONDecodeError:
+            pass
+
+    suffix = os.path.splitext(file.filename or "match.mp4")[1] or ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    try:
+        tracking = _run_tracking(tmp_path, squad_map)
+        events = detect_sprint_events(tracking["players"], threshold_kmh)
+        raw_clips = clip_highlights(tmp_path, events, max_clips=max_clips)
+        clip_results = upload_clips_to_r2(raw_clips)
+        return {
+            "clips": clip_results,
+            "events_detected": len(events),
+            "clips_generated": len(clip_results),
+            "stats": tracking["stats"],
+        }
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------

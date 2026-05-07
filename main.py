@@ -31,7 +31,8 @@ import httpx
 import numpy as np
 import supervision as sv
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.cluster import KMeans
 from ultralytics import YOLO
@@ -733,6 +734,121 @@ async def clip_video(
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Background video pipeline (Video Highlight Pipeline — Step 1)
+# ---------------------------------------------------------------------------
+
+class ProcessVideoRequest(BaseModel):
+    video_key: str
+    match_id: int
+    callback_url: str
+
+
+def download_from_r2(video_key: str) -> str:
+    r2_account = os.environ.get("R2_ACCOUNT_ID")
+    r2_access  = os.environ.get("R2_ACCESS_KEY_ID")
+    r2_secret  = os.environ.get("R2_SECRET_ACCESS_KEY")
+    r2_bucket  = os.environ.get("R2_BUCKET", "grassroots-media")
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=f"https://{r2_account}.r2.cloudflarestorage.com",
+        aws_access_key_id=r2_access,
+        aws_secret_access_key=r2_secret,
+        region_name="auto",
+    )
+    suffix = os.path.splitext(video_key)[1] or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    s3.download_fileobj(r2_bucket, video_key, tmp)
+    tmp.close()
+    return tmp.name
+
+
+def run_pipeline(video_key: str, match_id: int, callback_url: str) -> None:
+    video_path = None
+    try:
+        video_path = download_from_r2(video_key)
+        tracking   = _run_tracking(video_path, {})
+        events     = detect_sprint_events(tracking["players"])
+        raw_clips  = clip_highlights(video_path, events, max_clips=10)
+        r2_account = os.environ.get("R2_ACCOUNT_ID")
+        r2_access  = os.environ.get("R2_ACCESS_KEY_ID")
+        r2_secret  = os.environ.get("R2_SECRET_ACCESS_KEY")
+        r2_bucket  = os.environ.get("R2_BUCKET", "grassroots-media")
+        r2_public  = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
+        s3_client = None
+        if all([r2_account, r2_access, r2_secret]):
+            s3_client = boto3.client(
+                "s3",
+                endpoint_url=f"https://{r2_account}.r2.cloudflarestorage.com",
+                aws_access_key_id=r2_access,
+                aws_secret_access_key=r2_secret,
+                region_name="auto",
+            )
+        clips_out = []
+        for clip in raw_clips:
+            key = f"highlights/{match_id}/{int(time.time())}-p{clip['event']['player_id']}-{clip['start']}s.mp4"
+            url = ""
+            try:
+                if s3_client:
+                    s3_client.upload_file(
+                        clip["clip_path"], r2_bucket, key,
+                        ExtraArgs={"ContentType": "video/mp4"},
+                    )
+                    url = f"{r2_public}/{key}" if r2_public else ""
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.unlink(clip["clip_path"])
+                except OSError:
+                    pass
+            clips_out.append({
+                "player_id":  clip["event"]["player_id"],
+                "event_type": "sprint",
+                "timestamp":  clip["event"]["second"],
+                "speed":      clip["event"]["speed_kmh"],
+                "url":        url,
+                "r2_key":     key,
+            })
+        with httpx.Client(timeout=30) as client:
+            client.post(callback_url, json={
+                "match_id": match_id,
+                "status":   "complete",
+                "clips":    clips_out,
+            })
+    except Exception as exc:
+        try:
+            with httpx.Client(timeout=10) as client:
+                client.post(callback_url, json={
+                    "match_id": match_id,
+                    "status":   "failed",
+                    "error":    str(exc),
+                    "clips":    [],
+                })
+        except Exception:
+            pass
+    finally:
+        if video_path:
+            try:
+                os.unlink(video_path)
+            except OSError:
+                pass
+
+
+@app.post("/process-video")
+async def process_video(
+    req: ProcessVideoRequest,
+    background_tasks: BackgroundTasks,
+) -> dict[str, str]:
+    """
+    Download video from R2, run YOLOv8 tracking + sprint detection + FFmpeg clipping,
+    upload highlight clips back to R2, then POST results to callback_url.
+    Returns immediately — processing happens in the background.
+    """
+    background_tasks.add_task(run_pipeline, req.video_key, req.match_id, req.callback_url)
+    return {"status": "processing", "match_id": str(req.match_id)}
 
 
 # ---------------------------------------------------------------------------

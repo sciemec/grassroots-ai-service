@@ -15,10 +15,13 @@ GET  /health — liveness check
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import re
 import subprocess
 import tempfile
+import uuid as uuid_mod
 from collections import defaultdict
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -57,6 +60,9 @@ app.add_middleware(
 )
 
 _model: YOLO | None = None
+
+# In-memory job store for async analysis jobs — expires after 2h
+_jobs: dict[str, dict] = {}
 
 
 def get_model() -> YOLO:
@@ -849,6 +855,235 @@ async def process_video(
     """
     background_tasks.add_task(run_pipeline, req.video_key, req.match_id, req.callback_url)
     return {"status": "processing", "match_id": str(req.match_id)}
+
+
+# ---------------------------------------------------------------------------
+# Background match analysis (Gemini File API + Claude narrative)
+# ---------------------------------------------------------------------------
+
+class AnalyseRequest(BaseModel):
+    fileUri: str
+    fileName: str
+    mimeType: str
+    fileState: Optional[str] = None
+    homeTeam: str
+    awayTeam: str
+    competition: Optional[str] = ""
+    sport: Optional[str] = "football"
+
+
+async def _wait_for_file_active(file_name: str, google_key: str, job_id: str) -> None:
+    """Poll Gemini until the uploaded file state is ACTIVE."""
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=30.0, read=60.0, write=10.0, pool=10.0)
+    ) as client:
+        for _ in range(120):
+            res = await client.get(
+                f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={google_key}"
+            )
+            if not res.is_success:
+                raise RuntimeError(f"File state check failed: {res.status_code} — {res.text[:200]}")
+            data = res.json()
+            state = data.get("state", "")
+            if state == "ACTIVE":
+                return
+            if state == "FAILED":
+                raise RuntimeError("Gemini file processing failed")
+            _jobs[job_id]["message"] = f"Gemini processing video... (state: {state})"
+            await asyncio.sleep(5)
+    raise RuntimeError("Video did not become ready within 10 minutes")
+
+
+def _extract_json(text: str) -> dict | None:
+    """Parse JSON from Gemini response — handles plain JSON or markdown code blocks."""
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    md = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    if md:
+        try:
+            return json.loads(md.group(1))
+        except Exception:
+            pass
+    obj = re.search(r"\{[\s\S]*\}", text)
+    if obj:
+        try:
+            return json.loads(obj.group(0))
+        except Exception:
+            pass
+    return None
+
+
+async def _analyse_background(job_id: str, req: AnalyseRequest) -> None:
+    """Run Gemini 1.5 Pro analysis + Claude narrative in the background."""
+    try:
+        google_key = os.environ.get("GOOGLE_AI_API_KEY", "")
+        if not google_key:
+            raise RuntimeError("GOOGLE_AI_API_KEY not configured on AI service")
+
+        _jobs[job_id]["message"] = "Waiting for Gemini to finish processing the video..."
+        _jobs[job_id]["progress"] = 10
+
+        if req.fileState != "ACTIVE":
+            await _wait_for_file_active(req.fileName, google_key, job_id)
+
+        _jobs[job_id]["message"] = "Gemini 1.5 Pro is watching the full match — this takes several minutes..."
+        _jobs[job_id]["progress"] = 30
+
+        system_prompt = (
+            f"You are a professional football analyst with UEFA A-licence coaching experience.\n"
+            f"You will watch the full match video: {req.homeTeam} vs {req.awayTeam}"
+            + (f" ({req.competition})" if req.competition else "")
+            + (f" — Sport: {req.sport}" if req.sport else "")
+            + """\n\nWatch the entire video. Observe player positions, ball movement, team shapes, events, and tactical patterns throughout the full match.\n\n"""
+            """Return ONLY a valid JSON object — no markdown, no explanation — with this exact structure:\n"""
+            """{\n"""
+            """  "formation_home": "4-3-3",\n"""
+            """  "formation_away": "4-4-2",\n"""
+            """  "possession_home": 55,\n"""
+            """  "possession_away": 45,\n"""
+            """  "shots_home": 8,\n"""
+            """  "shots_away": 5,\n"""
+            """  "shots_on_target_home": 4,\n"""
+            """  "shots_on_target_away": 2,\n"""
+            """  "fouls_detected": 3,\n"""
+            """  "key_events": [\n"""
+            """    { "time": "23:00", "team": "home", "type": "shot", "description": "Right-footed shot from edge of box" }\n"""
+            """  ],\n"""
+            """  "tactical_patterns": ["Home team pressed high in the first 30 minutes"],\n"""
+            """  "defensive_issues": ["Left back exposed on counter-attacks repeatedly"],\n"""
+            """  "attacking_strengths": ["Strong combination play through the central midfield"],\n"""
+            """  "man_of_match_candidate": "Home team central midfielder — controlled the tempo all match",\n"""
+            """  "halftime_recommendation": "Push the right winger higher and switch to a 4-2-3-1",\n"""
+            """  "key_coaching_points": ["Defensive line needs to step up 5 metres when opponent goalkeeper has the ball"]\n"""
+            """}\n\n"""
+            """For possession: estimate from which team controlled the ball across the full match.\n"""
+            """For events: include all significant events with accurate timestamps.\n"""
+            """For formations: identify from player positioning throughout the full match.\n"""
+            """Be specific and professional. Base everything on what you observe in the video."""
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0)) as client:
+            gemini_res = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={google_key}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{
+                        "parts": [
+                            {"text": system_prompt},
+                            {"file_data": {"mime_type": req.mimeType, "file_uri": req.fileUri}},
+                            {"text": "Now provide your complete JSON analysis of this full match video."},
+                        ]
+                    }],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096},
+                },
+            )
+
+        _jobs[job_id]["progress"] = 75
+        _jobs[job_id]["message"] = "Gemini analysis complete — generating tactical narrative..."
+
+        if not gemini_res.is_success:
+            raise RuntimeError(f"Gemini API error: {gemini_res.status_code} — {gemini_res.text[:300]}")
+
+        gemini_data = gemini_res.json()
+        gemini_text = (
+            gemini_data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        analysis = _extract_json(gemini_text)
+        if analysis is None:
+            raise RuntimeError(f"Gemini returned unreadable analysis: {gemini_text[:300]}")
+
+        # Claude narrative (optional — only if key is set)
+        narrative = ""
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if anthropic_key:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=120.0, write=10.0, pool=10.0)) as client:
+                claude_res = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": anthropic_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 1500,
+                        "messages": [{
+                            "role": "user",
+                            "content": (
+                                f"You are a professional football analyst writing a post-match report for a coach.\n\n"
+                                f"Match: {req.homeTeam} vs {req.awayTeam}"
+                                + (f"\nCompetition: {req.competition}" if req.competition else "")
+                                + (f"\nSport: {req.sport}" if req.sport else "")
+                                + f"\n\nAI Vision Analysis (Gemini 1.5 Pro watched the full match video natively):\n"
+                                + json.dumps(analysis, indent=2)
+                                + "\n\nWrite a professional 4-paragraph tactical match report:\n"
+                                "1. Match overview — what happened and who controlled the game\n"
+                                "2. Tactical analysis — what formations were used, what worked, what didn't\n"
+                                "3. Individual highlights and areas of concern\n"
+                                "4. Training recommendations for the next session based on what was seen\n\n"
+                                "Write as a UEFA A-licence coach. Be specific, direct, and actionable. "
+                                "Reference formations, patterns, and events by name. No generic advice."
+                            ),
+                        }],
+                    },
+                )
+            if claude_res.is_success:
+                narrative = claude_res.json().get("content", [{}])[0].get("text", "")
+
+        _jobs[job_id].update({
+            "status": "complete",
+            "progress": 100,
+            "message": "Analysis complete.",
+            "analysis": analysis,
+            "narrative": narrative,
+        })
+
+    except Exception as exc:
+        _jobs[job_id].update({"status": "failed", "error": str(exc), "progress": 0})
+
+
+@app.post("/analyse")
+async def analyse_match(req: AnalyseRequest, background_tasks: BackgroundTasks) -> dict[str, str]:
+    """
+    Start background Gemini 1.5 Pro + Claude match analysis.
+    Returns immediately with a job_id. Poll GET /job/{job_id} every 5s for status.
+    """
+    job_id = str(uuid_mod.uuid4())
+    _jobs[job_id] = {
+        "status": "processing",
+        "progress": 0,
+        "message": "Analysis queued...",
+        "analysis": None,
+        "narrative": None,
+        "error": None,
+        "created_at": time.time(),
+    }
+    background_tasks.add_task(_analyse_background, job_id, req)
+    return {"job_id": job_id}
+
+
+@app.get("/job/{job_id}")
+async def get_job(job_id: str) -> dict:
+    """
+    Poll for background job status. Returns job dict with status, progress, analysis, narrative, error.
+    Cleans up jobs older than 2 hours.
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found — it may have expired")
+
+    # Clean up expired jobs (> 2h old)
+    now = time.time()
+    expired = [k for k, v in list(_jobs.items()) if now - v.get("created_at", now) > 7200]
+    for k in expired:
+        _jobs.pop(k, None)
+
+    return job
 
 
 # ---------------------------------------------------------------------------

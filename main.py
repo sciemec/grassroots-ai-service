@@ -966,7 +966,7 @@ async def _analyse_background(job_id: str, req: AnalyseRequest) -> None:
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=10.0)) as client:
             gemini_res = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={google_key}",
+                f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key={google_key}",
                 headers={"Content-Type": "application/json"},
                 json={
                     "contents": [{

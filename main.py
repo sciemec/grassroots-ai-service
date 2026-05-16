@@ -1087,6 +1087,90 @@ async def get_job(job_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Thumbnail generation (Fan Hub — extract frame at 3s, upload to R2)
+# ---------------------------------------------------------------------------
+
+class GenerateThumbnailRequest(BaseModel):
+    video_url: str  # Public R2 URL of the uploaded fan hub video
+
+
+@app.post("/generate-thumbnail")
+async def generate_thumbnail(req: GenerateThumbnailRequest) -> dict[str, str]:
+    """
+    Download a video from R2, extract the frame at the 3-second mark,
+    upload it as a JPEG to R2 under thumbnails/fan-hub/, and return the URL.
+    """
+    tmp_video = None
+    tmp_thumb = None
+    try:
+        # Download video into a temp file
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            tmp_video = f.name
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=15.0, read=120.0, write=10.0, pool=5.0)) as client:
+            async with client.stream("GET", req.video_url) as resp:
+                if not resp.is_success:
+                    raise HTTPException(status_code=502, detail=f"Could not download video: {resp.status_code}")
+                with open(tmp_video, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=1024 * 256):
+                        f.write(chunk)
+
+        # Extract frame at 3-second mark using OpenCV
+        cap = cv2.VideoCapture(tmp_video)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        target_frame = int(fps * 3)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret or frame is None:
+            # Fall back to first frame if 3s seek fails
+            cap = cv2.VideoCapture(tmp_video)
+            ret, frame = cap.read()
+            cap.release()
+
+        if not ret or frame is None:
+            raise HTTPException(status_code=422, detail="Could not extract frame from video")
+
+        # Encode as JPEG
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            tmp_thumb = f.name
+        cv2.imwrite(tmp_thumb, frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+
+        # Upload JPEG to R2
+        r2_bucket = os.environ.get("R2_BUCKET", "grassroots-videos")
+        r2_public = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
+        thumb_key = f"thumbnails/fan-hub/{uuid_mod.uuid4()}.jpg"
+        thumbnail_url = ""
+
+        try:
+            s3_client = boto3.client(
+                "s3",
+                endpoint_url=f"https://{os.environ.get('R2_ACCOUNT_ID', '')}.r2.cloudflarestorage.com",
+                aws_access_key_id=os.environ.get("R2_ACCESS_KEY_ID", ""),
+                aws_secret_access_key=os.environ.get("R2_SECRET_ACCESS_KEY", ""),
+                region_name="auto",
+            )
+            s3_client.upload_file(
+                tmp_thumb, r2_bucket, thumb_key,
+                ExtraArgs={"ContentType": "image/jpeg"},
+            )
+            thumbnail_url = f"{r2_public}/{thumb_key}" if r2_public else ""
+        except Exception as upload_err:
+            raise HTTPException(status_code=502, detail=f"R2 upload failed: {upload_err}")
+
+        return {"thumbnail_url": thumbnail_url, "r2_key": thumb_key}
+
+    finally:
+        for path in [tmp_video, tmp_thumb]:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 

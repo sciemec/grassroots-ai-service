@@ -114,7 +114,9 @@ def get_pose_landmarker() -> mp_vision.PoseLandmarker:
             min_pose_detection_confidence=0.5,
             min_pose_presence_confidence=0.5,
             min_tracking_confidence=0.5,
-            running_mode=mp_vision.RunningMode.VIDEO,
+            # IMAGE mode: no per-session timestamp state — safe to reuse the same
+            # landmarker instance across multiple videos without timestamp conflicts.
+            running_mode=mp_vision.RunningMode.IMAGE,
         )
         _pose_landmarker = mp_vision.PoseLandmarker.create_from_options(options)
     return _pose_landmarker
@@ -249,7 +251,6 @@ def process_video_with_mediapipe(
     sample_every = max(1, int(round(orig_fps / target_fps)))
     frame_measurements: list[dict] = []
     frame_idx    = 0
-    timestamp_ms = 0.0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -257,12 +258,12 @@ def process_video_with_mediapipe(
         if frame_idx % sample_every == 0:
             rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = landmarker.detect_for_video(mp_img, int(timestamp_ms))
+            # IMAGE mode: use detect() — no timestamp argument needed or allowed
+            result = landmarker.detect(mp_img)
             if result.pose_world_landmarks:
                 m = measure_frame(result.pose_world_landmarks[0])
                 if m:
                     frame_measurements.append(m)
-            timestamp_ms += 1000.0 / target_fps
         frame_idx += 1
     cap.release()
     if len(frame_measurements) < 5:
@@ -446,8 +447,17 @@ async def athletic_test(
             tmp.write(chunk)
     try:
         _, agg = process_video_with_mediapipe(tmp_path)
-        scorers = {"jump": score_jump, "sprinting": score_sprint, "balance": score_balance, "endurance": score_endurance}
+        scorers = {
+            "jump":      score_jump,
+            "sprint":    score_sprint,   # frontend sends "sprint" (was "sprinting" — fixed)
+            "balance":   score_balance,
+            "endurance": score_endurance,
+        }
         return scorers.get(test_type, score_general)(agg, age_group)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Analysis error: {exc}") from exc
     finally:
         try: os.unlink(tmp_path)
         except OSError: pass

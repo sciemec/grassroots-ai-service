@@ -600,12 +600,157 @@ def score_drill_first_touch(agg: dict, age: str) -> dict[str, Any]:
         "speed_of_play":   {"score": None, "measurable": False, "detail": "Speed of play assessment requires game context — rate manually."},
     }
 
+def score_drill_free_kick(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+    trunk = agg.get("trunk_lean_deg", {}).get("mean")
+    if trunk is not None:
+        se_pct = min(100, max(0, round((1 - abs(trunk - 15) / 30) * 100)))
+        se_detail = f"Trunk lean {round(trunk, 1)}° at approach — {'good strike elevation control' if se_pct >= 65 else 'adjust trunk angle to control ball height — lean forward for driven shots, lean back for loft'}."
+    else:
+        se_pct, se_detail = None, "Trunk lean not detected."
+    hip = agg.get("hip_drop_mm", {}).get("mean")
+    if hip is not None:
+        ab_pct = percentile_from_bench(hip, bench["balance_hip_drop"], higher_is_better=False)
+        ab_detail = f"Hip drop {round(hip, 1)}mm — {'level approach helps consistent strike' if ab_pct >= 65 else 'keep hips level on approach for a more consistent contact point'}."
+    else:
+        ab_pct, ab_detail = None, "Hip balance not detected."
+    return {
+        "strike_elevation": {"score": se_pct, "measurable": se_pct is not None, "detail": se_detail},
+        "approach_balance": {"score": ab_pct, "measurable": ab_pct is not None, "detail": ab_detail},
+        "bend_accuracy":    {"score": None, "measurable": False, "detail": "Bend accuracy requires ball tracking — rate manually."},
+        "wall_clearance":   {"score": None, "measurable": False, "detail": "Wall clearance requires match context — rate manually."},
+    }
+
+
+def score_drill_heading(agg: dict, age: str) -> dict[str, Any]:
+    trunk = agg.get("trunk_lean_deg", {}).get("mean")
+    if trunk is not None:
+        aa_pct = min(100, max(0, round(min(trunk / 20, 1) * 100)))
+        aa_detail = f"Trunk lean {round(trunk, 1)}° — {'good attacking angle into the ball' if aa_pct >= 60 else 'lean into the ball more — attack it with your forehead, do not wait for it'}."
+    else:
+        aa_pct, aa_detail = None, "Trunk lean not detected."
+    l_knee = agg.get("left_knee_flexion",  {}).get("mean")
+    r_knee = agg.get("right_knee_flexion", {}).get("mean")
+    if l_knee and r_knee:
+        diff   = abs(l_knee - r_knee)
+        bc_pct = min(100, max(0, round((1 - diff / 30) * 100)))
+        bc_detail = f"Knee symmetry difference {round(diff, 1)}° — {'balanced bilateral jump' if bc_pct >= 70 else 'work on bilateral jump technique — both legs should contribute equally'}."
+    else:
+        bc_pct, bc_detail = None, "Bilateral symmetry not detected."
+    return {
+        "attack_angle":           {"score": aa_pct, "measurable": aa_pct is not None, "detail": aa_detail},
+        "bilateral_coordination": {"score": bc_pct, "measurable": bc_pct is not None, "detail": bc_detail},
+        "forehead_contact":       {"score": None, "measurable": False, "detail": "Forehead contact point requires face tracking — rate manually."},
+    }
+
+
+def score_drill_crossing(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+    trunk = agg.get("trunk_lean_deg", {}).get("mean")
+    if trunk is not None:
+        dh_pct = min(100, max(0, round((1 - abs(trunk - 12) / 25) * 100)))
+        dh_detail = f"Trunk lean {round(trunk, 1)}° at delivery — {'good cross height control' if dh_pct >= 65 else 'lean back for high crosses, stay over ball for driven crosses'}."
+    else:
+        dh_pct, dh_detail = None, "Trunk lean not detected."
+    hip = agg.get("hip_drop_mm", {}).get("mean")
+    if hip is not None:
+        bb_pct = percentile_from_bench(hip, bench["balance_hip_drop"], higher_is_better=False)
+        bb_detail = f"Hip balance {round(hip, 1)}mm drop — {'stable base for consistent delivery' if bb_pct >= 65 else 'stabilise your hip position on approach for more consistent crossing'}."
+    else:
+        bb_pct, bb_detail = None, "Hip balance not detected."
+    return {
+        "delivery_height":    {"score": dh_pct, "measurable": dh_pct is not None, "detail": dh_detail},
+        "body_balance":       {"score": bb_pct, "measurable": bb_pct is not None, "detail": bb_detail},
+        "landing_zone":       {"score": None, "measurable": False, "detail": "Landing zone accuracy requires ball tracking — rate manually."},
+        "weak_foot_delivery": {"score": None, "measurable": False, "detail": "Weak foot delivery requires a separate session — rate manually."},
+    }
+
+
+def score_drill_ball_juggling(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+    hip_mean = agg.get("hip_drop_mm", {}).get("mean")
+    if hip_mean is not None:
+        bb_pct = percentile_from_bench(hip_mean, bench["balance_hip_drop"], higher_is_better=False)
+        bb_detail = f"Hip balance {round(hip_mean, 1)}mm average drop — {'stable core throughout juggling sequence' if bb_pct >= 65 else 'keep your core tight and hips level — stability improves touch consistency'}."
+    else:
+        bb_pct, bb_detail = None, "Hip balance not detected."
+    com_min = agg.get("com_height", {}).get("min")
+    com_max = agg.get("com_height", {}).get("max")
+    if com_min is not None and com_max is not None:
+        variation = (com_max - com_min) * 100
+        ts_pct    = min(100, max(0, round((1 - variation / 20) * 100)))
+        ts_detail = f"COM height variation {round(variation, 1)}cm — {'consistent juggling platform' if ts_pct >= 65 else 'reduce body movement between touches — a stable platform helps you maintain longer sequences'}."
+    else:
+        ts_pct, ts_detail = None, "COM stability not detected."
+    return {
+        "body_balance":      {"score": bb_pct, "measurable": bb_pct is not None, "detail": bb_detail},
+        "touch_stability":   {"score": ts_pct, "measurable": ts_pct is not None, "detail": ts_detail},
+        "consecutive_count": {"score": None, "measurable": False, "detail": "Consecutive juggle count requires ball tracking — rate manually."},
+        "weak_foot_control": {"score": None, "measurable": False, "detail": "Weak foot control requires a separate session — rate manually."},
+    }
+
+
+def score_drill_throw_in(agg: dict, age: str) -> dict[str, Any]:
+    trunk     = agg.get("trunk_lean_deg", {}).get("mean")
+    trunk_max = agg.get("trunk_lean_deg", {}).get("max")
+    if trunk is not None and trunk_max is not None:
+        arc      = trunk_max - trunk
+        tech_pct = min(100, max(0, round(min(arc / 25, 1) * 100)))
+        tech_detail = f"Trunk arc {round(arc, 1)}° — {'good throw-in technique — full body arc from back to front' if tech_pct >= 65 else 'use a fuller body arc — lean back before throwing and drive forward through the ball'}."
+    else:
+        tech_pct, tech_detail = None, "Trunk arc not detected."
+    l_elbow = agg.get("left_elbow_flexion",  {}).get("mean")
+    r_elbow = agg.get("right_elbow_flexion", {}).get("mean")
+    if l_elbow and r_elbow:
+        diff   = abs(l_elbow - r_elbow)
+        ss_pct = min(100, max(0, round((1 - diff / 30) * 100)))
+        ss_detail = f"Arm symmetry difference {round(diff, 1)}° — {'both arms contributing equally to the throw' if ss_pct >= 70 else 'both hands must maintain equal contact on the ball throughout the throw-in'}."
+    else:
+        ss_pct, ss_detail = None, "Arm symmetry not detected."
+    return {
+        "technique":           {"score": tech_pct, "measurable": tech_pct is not None, "detail": tech_detail},
+        "shoulder_symmetry":   {"score": ss_pct,   "measurable": ss_pct is not None,  "detail": ss_detail},
+        "distance_reach":      {"score": None, "measurable": False, "detail": "Distance reach requires ball tracking — rate manually."},
+        "non_dominant_stance": {"score": None, "measurable": False, "detail": "Non-dominant foot stance requires a separate assessment — rate manually."},
+    }
+
+
+def score_drill_rebound_turn_strike(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+    com = agg.get("com_height", {}).get("mean")
+    if com is not None:
+        ts_pct    = percentile_from_bench(com, bench["agility_com_height"], higher_is_better=False)
+        ts_detail = f"COM height {round(com, 3)} — {'low centre of gravity helps sharp turning' if ts_pct >= 65 else 'bend your knees and lower your centre of gravity when turning — this makes direction changes faster'}."
+    else:
+        ts_pct, ts_detail = None, "COM height not detected."
+    trunk = agg.get("trunk_lean_deg", {}).get("mean")
+    if trunk is not None:
+        bs_pct    = min(100, max(0, round(min(trunk / 18, 1) * 100)))
+        bs_detail = f"Trunk angle {round(trunk, 1)}° — {'good body shield position' if bs_pct >= 60 else 'use your body to shield the ball — lean your trunk across to create a barrier between ball and defender'}."
+        sa_pct    = min(100, max(0, round((1 - abs(trunk - 10) / 20) * 100)))
+        sa_detail = f"Trunk lean at strike {round(trunk, 1)}° — {'balanced strike position after turn' if sa_pct >= 65 else 'stay balanced over the ball at contact — rushing the strike after a turn reduces accuracy'}."
+    else:
+        bs_pct, bs_detail = None, "Body position not detected."
+        sa_pct, sa_detail = None, "Strike position not detected."
+    return {
+        "turn_sharpness": {"score": ts_pct, "measurable": ts_pct is not None, "detail": ts_detail},
+        "body_shield":    {"score": bs_pct, "measurable": bs_pct is not None, "detail": bs_detail},
+        "strike_accuracy":{"score": sa_pct, "measurable": sa_pct is not None, "detail": sa_detail},
+    }
+
+
 _SKILL_DRILL_SCORERS: dict[str, Any] = {
-    "shooting":    score_drill_shooting,
-    "passing":     score_drill_passing,
-    "tackling":    score_drill_tackling,
-    "dribbling":   score_drill_dribbling,
-    "first_touch": score_drill_first_touch,
+    "shooting":             score_drill_shooting,
+    "passing":              score_drill_passing,
+    "tackling":             score_drill_tackling,
+    "dribbling":            score_drill_dribbling,
+    "first_touch":          score_drill_first_touch,
+    "free_kick":            score_drill_free_kick,
+    "heading":              score_drill_heading,
+    "crossing":             score_drill_crossing,
+    "ball_juggling":        score_drill_ball_juggling,
+    "throw_in":             score_drill_throw_in,
+    "rebound_turn_strike":  score_drill_rebound_turn_strike,
 }
 
 # ---------------------------------------------------------------------------

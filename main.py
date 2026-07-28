@@ -286,6 +286,9 @@ BENCHMARKS: dict[str, dict] = {
         "balance_hip_drop":      {"elite": 8,    "good": 18,   "needs_work": 30},
         "balance_knee_valgus":   {"elite": 8,    "good": 18,   "needs_work": 30},
         "endurance_degradation": {"elite": 5,    "good": 12,   "needs_work": 20},
+        "agility_cut_knee":      {"elite": 110,  "good": 125,  "needs_work": 140},
+        "agility_symmetry":      {"elite": 8,    "good": 12,   "needs_work": 18},
+        "agility_com_height":    {"elite": 0.47, "good": 0.52, "needs_work": 0.57},
     },
     "u17": {
         "jump_com_drop":         {"elite": 0.22, "good": 0.17, "needs_work": 0.12},
@@ -295,6 +298,9 @@ BENCHMARKS: dict[str, dict] = {
         "balance_hip_drop":      {"elite": 6,    "good": 14,   "needs_work": 25},
         "balance_knee_valgus":   {"elite": 6,    "good": 14,   "needs_work": 25},
         "endurance_degradation": {"elite": 4,    "good": 10,   "needs_work": 18},
+        "agility_cut_knee":      {"elite": 100,  "good": 115,  "needs_work": 130},
+        "agility_symmetry":      {"elite": 6,    "good": 10,   "needs_work": 15},
+        "agility_com_height":    {"elite": 0.45, "good": 0.50, "needs_work": 0.55},
     },
     "senior": {
         "jump_com_drop":         {"elite": 0.25, "good": 0.20, "needs_work": 0.14},
@@ -304,6 +310,9 @@ BENCHMARKS: dict[str, dict] = {
         "balance_hip_drop":      {"elite": 5,    "good": 12,   "needs_work": 22},
         "balance_knee_valgus":   {"elite": 5,    "good": 12,   "needs_work": 22},
         "endurance_degradation": {"elite": 3,    "good": 8,    "needs_work": 15},
+        "agility_cut_knee":      {"elite": 95,   "good": 110,  "needs_work": 125},
+        "agility_symmetry":      {"elite": 5,    "good": 8,    "needs_work": 12},
+        "agility_com_height":    {"elite": 0.43, "good": 0.48, "needs_work": 0.53},
     },
 }
 
@@ -426,6 +435,50 @@ def score_general(agg: dict, age: str) -> dict[str, Any]:
         "detail": f"General athletic movement scored {pct}th percentile.",
     }
 
+def score_agility(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+
+    # Cut depth — minimum knee flexion captured during direction changes
+    # Deeper bend (lower angle) = better cutting mechanics, like a jump landing
+    l_min = agg.get("left_knee_flexion",  {}).get("min")
+    r_min = agg.get("right_knee_flexion", {}).get("min")
+    cut_pct  = 50
+    avg_cut  = None
+    if l_min and r_min:
+        avg_cut = (l_min + r_min) / 2
+        cut_pct = percentile_from_bench(avg_cut, bench["agility_cut_knee"], higher_is_better=False)
+
+    # Left/right cut symmetry — balanced direction changes on both sides
+    asym_pct = 50
+    asym     = None
+    if l_min and r_min and max(l_min, r_min) > 0:
+        asym     = abs(l_min - r_min) / max(l_min, r_min) * 100
+        asym_pct = percentile_from_bench(asym, bench["agility_symmetry"], higher_is_better=False)
+
+    # COM height — lower mean = athlete stays in athletic stance throughout
+    com_pct  = 50
+    com_mean = agg.get("com_height", {}).get("mean")
+    if com_mean:
+        com_pct = percentile_from_bench(com_mean, bench["agility_com_height"], higher_is_better=False)
+
+    overall    = round(cut_pct * 0.40 + asym_pct * 0.35 + com_pct * 0.25)
+    cut_label  = f"{round(avg_cut, 1)}°" if avg_cut is not None else "N/A"
+    asym_label = f"{round(asym, 1)}%"    if asym    is not None else "N/A"
+
+    return {
+        "test_score": overall, "percentile": overall, "rating": rating_from_pct(overall),
+        "key_metric": f"Cut depth: {cut_label} · L/R symmetry: {asym_label}",
+        "detail": (
+            f"Agility mechanics scored {overall}th percentile ({age}). "
+            f"Cut depth {cut_label} — "
+            f"{'excellent low centre of gravity during direction changes' if cut_pct >= 70 else 'bend the knees deeper when changing direction — lower COM = faster cuts'}. "
+            f"Cut symmetry: "
+            f"{'well balanced on both sides' if asym_pct >= 70 else 'favour one side — train cuts equally left and right to protect joints'}."
+        ),
+        "injury_flag": asym_pct < 40,
+        "injury_detail": "Significant cut asymmetry detected — overuse injury risk on the dominant side." if asym_pct < 40 else None,
+    }
+
 # ---------------------------------------------------------------------------
 # POST /athletic-test
 # ---------------------------------------------------------------------------
@@ -449,9 +502,10 @@ async def athletic_test(
         _, agg = process_video_with_mediapipe(tmp_path)
         scorers = {
             "jump":      score_jump,
-            "sprint":    score_sprint,   # frontend sends "sprint" (was "sprinting" — fixed)
+            "sprint":    score_sprint,
             "balance":   score_balance,
             "endurance": score_endurance,
+            "agility":   score_agility,
         }
         return scorers.get(test_type, score_general)(agg, age_group)
     except HTTPException:

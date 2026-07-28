@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     libgomp1 \
     ffmpeg \
+    libgles2 \
+    libegl1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

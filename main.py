@@ -43,7 +43,6 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from pydantic import BaseModel
 from sklearn.cluster import KMeans
-from ultralytics import YOLO
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -83,13 +82,14 @@ async def download_pose_model() -> None:
 # YOLOv8 — lazy loaded
 # ---------------------------------------------------------------------------
 
-_model: YOLO | None = None
+_model = None
 _jobs: dict[str, dict] = {}
 
 
-def get_model() -> YOLO:
+def get_model():
     global _model
     if _model is None:
+        from ultralytics import YOLO  # lazy — only loads when match tracking is requested
         _model = YOLO("yolov8x.pt")
     return _model
 

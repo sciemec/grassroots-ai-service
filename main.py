@@ -480,6 +480,135 @@ def score_agility(agg: dict, age: str) -> dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
+# Skill drill mechanics scorers
+# Each returns: {mechanic_key: {score: 0-100|None, measurable: bool, detail: str}}
+# score=None means MediaPipe cannot measure it — player rates manually.
+# ---------------------------------------------------------------------------
+
+def score_drill_shooting(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+    # body_shape: trunk lean forward (leaning over ball = better placement)
+    trunk = agg.get("trunk_lean_deg", {}).get("mean")
+    if trunk is not None:
+        body_pct = percentile_from_bench(trunk, bench["sprint_trunk_lean"], higher_is_better=True)
+        body_detail = f"Trunk lean {round(trunk, 1)}° — {'good body shape over ball' if body_pct >= 65 else 'lean forward more to stay over the ball on contact'}."
+    else:
+        body_pct, body_detail = None, "Trunk angle not detected."
+    # follow_through: trunk lean std deviation — more dynamic swing = more follow-through arc
+    trunk_std = agg.get("trunk_lean_deg", {}).get("std")
+    if trunk_std is not None:
+        ft_pct = min(100, max(0, round(trunk_std / 10 * 100)))
+        ft_detail = f"Swing variation {round(trunk_std, 1)}° — {'full follow-through arc detected' if ft_pct >= 60 else 'extend your swing arc more after ball contact'}."
+    else:
+        ft_pct, ft_detail = None, "Follow-through motion not detected."
+    return {
+        "body_shape":     {"score": body_pct, "measurable": body_pct is not None, "detail": body_detail},
+        "follow_through": {"score": ft_pct,   "measurable": ft_pct is not None,   "detail": ft_detail},
+        "plant_foot":     {"score": None, "measurable": False, "detail": "Plant foot position requires ball tracking — rate manually."},
+        "striking":       {"score": None, "measurable": False, "detail": "Ankle lock quality cannot be measured from pose — rate manually."},
+    }
+
+def score_drill_passing(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+    trunk = agg.get("trunk_lean_deg", {}).get("mean")
+    if trunk is not None:
+        body_pct = percentile_from_bench(trunk, bench["sprint_trunk_lean"], higher_is_better=True)
+        body_detail = f"Trunk lean {round(trunk, 1)}° — {'good open body shape for passing' if body_pct >= 65 else 'open your body more when passing — sideways-on stance improves accuracy'}."
+    else:
+        body_pct, body_detail = None, "Trunk angle not detected."
+    trunk_std = agg.get("trunk_lean_deg", {}).get("std")
+    if trunk_std is not None:
+        ft_pct = min(100, max(0, round(trunk_std / 10 * 100)))
+        ft_detail = f"Follow-through arc {round(trunk_std, 1)}° variation — {'complete follow-through toward target' if ft_pct >= 60 else 'follow through fully in the direction of your pass'}."
+    else:
+        ft_pct, ft_detail = None, "Follow-through not detected."
+    return {
+        "body_shape":      {"score": body_pct, "measurable": body_pct is not None, "detail": body_detail},
+        "follow_through":  {"score": ft_pct,   "measurable": ft_pct is not None,   "detail": ft_detail},
+        "weight_accuracy": {"score": None, "measurable": False, "detail": "Pass weight and accuracy require ball tracking — rate manually."},
+        "decision_making": {"score": None, "measurable": False, "detail": "Decision making cannot be measured from pose — rate manually."},
+    }
+
+def score_drill_tackling(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+    l = agg.get("left_knee_flexion",  {}).get("mean")
+    r = agg.get("right_knee_flexion", {}).get("mean")
+    if l and r:
+        avg_knee = (l + r) / 2
+        body_pct = percentile_from_bench(avg_knee, bench["jump_landing_knee"], higher_is_better=False)
+        body_detail = f"Knee flexion {round(avg_knee, 1)}° — {'good low centre of gravity in defensive stance' if body_pct >= 65 else 'bend knees more for a proper defensive low body shape'}."
+    else:
+        body_pct, body_detail = None, "Knee flexion not detected."
+    com = agg.get("com_height", {}).get("mean")
+    com_bench = bench.get("agility_com_height", {"elite": 0.43, "good": 0.48, "needs_work": 0.53})
+    if com is not None:
+        ap_pct = percentile_from_bench(com, com_bench, higher_is_better=False)
+        ap_detail = f"Centre of mass height {round(com, 2)} — {'low, controlled approach' if ap_pct >= 65 else 'stay lower in your approach — reduce COM height when closing the attacker'}."
+    else:
+        ap_pct, ap_detail = None, "COM height not detected."
+    return {
+        "body_shape": {"score": body_pct, "measurable": body_pct is not None, "detail": body_detail},
+        "approach":   {"score": ap_pct,   "measurable": ap_pct is not None,   "detail": ap_detail},
+        "timing":     {"score": None, "measurable": False, "detail": "Tackle timing requires opponent tracking — rate manually."},
+        "recovery":   {"score": None, "measurable": False, "detail": "Recovery positioning cannot be measured from pose — rate manually."},
+    }
+
+def score_drill_dribbling(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+    com = agg.get("com_height", {}).get("mean")
+    com_bench = bench.get("agility_com_height", {"elite": 0.43, "good": 0.48, "needs_work": 0.53})
+    if com is not None:
+        bp_pct = percentile_from_bench(com, com_bench, higher_is_better=False)
+        bp_detail = f"Centre of mass {round(com, 2)} — {'athletic low dribbling stance' if bp_pct >= 65 else 'stay lower when dribbling to improve balance and ball protection'}."
+    else:
+        bp_pct, bp_detail = None, "COM height not detected."
+    l_min = agg.get("left_knee_flexion",  {}).get("min")
+    r_min = agg.get("right_knee_flexion", {}).get("min")
+    if l_min and r_min:
+        avg_cut = (l_min + r_min) / 2
+        cod_pct = percentile_from_bench(avg_cut, bench["agility_cut_knee"], higher_is_better=False)
+        cod_detail = f"Cut knee bend {round(avg_cut, 1)}° — {'explosive direction changes' if cod_pct >= 65 else 'bend the knee deeper when cutting to change direction faster'}."
+    else:
+        cod_pct, cod_detail = None, "Direction change depth not detected."
+    return {
+        "body_position":       {"score": bp_pct,  "measurable": bp_pct is not None,  "detail": bp_detail},
+        "change_of_direction": {"score": cod_pct, "measurable": cod_pct is not None, "detail": cod_detail},
+        "ball_control":        {"score": None, "measurable": False, "detail": "Ball control requires ball tracking — rate manually."},
+        "awareness":           {"score": None, "measurable": False, "detail": "Spatial awareness cannot be measured from pose — rate manually."},
+    }
+
+def score_drill_first_touch(agg: dict, age: str) -> dict[str, Any]:
+    bench = BENCHMARKS[age]
+    l = agg.get("left_knee_flexion",  {}).get("mean")
+    r = agg.get("right_knee_flexion", {}).get("mean")
+    if l and r:
+        avg_knee = (l + r) / 2
+        cu_pct = percentile_from_bench(avg_knee, bench["jump_landing_knee"], higher_is_better=False)
+        cu_detail = f"Knee flexion {round(avg_knee, 1)}° on receive — {'good cushioning depth' if cu_pct >= 65 else 'bend knees more to cushion and control the ball on arrival'}."
+    else:
+        cu_pct, cu_detail = None, "Knee flexion not detected."
+    trunk_std = agg.get("trunk_lean_deg", {}).get("std")
+    if trunk_std is not None:
+        bs_pct = min(100, max(0, round(trunk_std / 8 * 100)))
+        bs_detail = f"Body rotation {round(trunk_std, 1)}° variation — {'good half-turn body shape before ball arrives' if bs_pct >= 60 else 'open your body earlier — scan and turn before the ball reaches you'}."
+    else:
+        bs_pct, bs_detail = None, "Body rotation not detected."
+    return {
+        "body_shape":      {"score": bs_pct, "measurable": bs_pct is not None, "detail": bs_detail},
+        "cushioning":      {"score": cu_pct, "measurable": cu_pct is not None, "detail": cu_detail},
+        "touch_direction": {"score": None, "measurable": False, "detail": "Touch direction requires ball tracking — rate manually."},
+        "speed_of_play":   {"score": None, "measurable": False, "detail": "Speed of play assessment requires game context — rate manually."},
+    }
+
+_SKILL_DRILL_SCORERS: dict[str, Any] = {
+    "shooting":    score_drill_shooting,
+    "passing":     score_drill_passing,
+    "tackling":    score_drill_tackling,
+    "dribbling":   score_drill_dribbling,
+    "first_touch": score_drill_first_touch,
+}
+
+# ---------------------------------------------------------------------------
 # POST /athletic-test
 # ---------------------------------------------------------------------------
 
@@ -585,6 +714,8 @@ async def analyse_drill(
             flags.append({"name": "Fatigue Breakdown", "severity": "None", "detected": False, "measurement": f"{round(avg_d,1)}%", "percentile": fp, "detail": "Good technique maintenance throughout."})
         rl = "Critical" if risk >= 60 else "High" if risk >= 40 else "Moderate" if risk >= 20 else "Low" if risk >= 10 else "Excellent"
         op = round(sum(s["percentile"] for s in scores) / max(len(scores), 1))
+        skill_fn = _SKILL_DRILL_SCORERS.get(drill_type)
+        mechanics = skill_fn(agg, age_group) if skill_fn else None
         return {
             "overall_percentile": op, "overall_rating": rating_from_pct(op),
             "drill_type": drill_type, "drill_description": drill_type.replace("_", " ").title(),
@@ -592,6 +723,7 @@ async def analyse_drill(
             "scores": scores,
             "injury_risk": {"overall_risk_score": min(100, risk), "risk_level": rl, "flags": flags,
                 "summary": f"{sum(1 for f in flags if f['detected'])} risk factors. Overall: {rl}."},
+            "mechanics": mechanics,
             "progress": None,
             "scout_summary": f"Scored {op}th percentile for {drill_type} among {age_group} athletes. Rating: {rating_from_pct(op)}. Injury risk: {rl}.",
         }

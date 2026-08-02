@@ -258,8 +258,25 @@ def process_video_with_mediapipe(
     video_path: str,
     target_fps: int = 10,
 ) -> tuple[list[dict], dict]:
-    landmarker   = get_pose_landmarker()
+    # Create a fresh PoseLandmarker per request rather than reusing the
+    # singleton. The singleton's first-use-after-cold-start reliably returns
+    # frames=0 or frames=1 because the internal landmark_projection_calculator
+    # hasn't been primed with real (non-blank) image dimensions. Per-request
+    # creation means each video initialises the calculator with its own real
+    # frames, eliminating cold-start detection failures.
+    # Overhead is negligible: the XNNPACK compiled kernels are cached on disk
+    # by TFLite and reused across instances within the same process.
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path="pose_landmarker_heavy.task"),
+        output_segmentation_masks=False,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+        running_mode=mp_vision.RunningMode.IMAGE,
+    )
     cap          = cv2.VideoCapture(video_path)
+    landmarker   = mp_vision.PoseLandmarker.create_from_options(options)
     if not cap.isOpened():
         print(f"[athletic-test] 422 path=CANNOT_OPEN file={video_path}", flush=True)
         raise HTTPException(status_code=422, detail="Cannot open video file")

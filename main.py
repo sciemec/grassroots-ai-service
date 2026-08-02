@@ -246,6 +246,7 @@ def process_video_with_mediapipe(
     landmarker   = get_pose_landmarker()
     cap          = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        print(f"[athletic-test] 422 path=CANNOT_OPEN file={video_path}", flush=True)
         raise HTTPException(status_code=422, detail="Cannot open video file")
     orig_fps     = cap.get(cv2.CAP_PROP_FPS) or 30.0
     sample_every = max(1, int(round(orig_fps / target_fps)))
@@ -267,6 +268,7 @@ def process_video_with_mediapipe(
         frame_idx += 1
     cap.release()
     if len(frame_measurements) < 5:
+        print(f"[athletic-test] 422 path=POSE_COUNT frames={len(frame_measurements)}", flush=True)
         raise HTTPException(
             status_code=422,
             detail="Not enough pose detections. Ensure your full body is visible and lighting is good.",
@@ -785,6 +787,7 @@ async def athletic_test(
     except HTTPException:
         raise
     except Exception as exc:
+        print(f"[athletic-test] 422 path=EXCEPTION type={type(exc).__name__} detail={exc!r}", flush=True)
         raise HTTPException(status_code=422, detail=f"Analysis error: {exc}") from exc
     finally:
         try: os.unlink(tmp_path)

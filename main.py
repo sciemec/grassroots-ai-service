@@ -82,8 +82,15 @@ async def download_pose_model() -> None:
     # the first real request arrives. Without this, the first request after
     # a cold start returns frames=0 (422) because the model isn't ready.
     lm = get_pose_landmarker()
-    blank = np.zeros((64, 64, 3), dtype=np.uint8)
-    lm.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=blank))
+    # 20 iterations at a realistic video frame size (640×480) forces the
+    # TFLite XNNPACK thread pool to fully spin up and primes the complete
+    # MediaPipe pipeline before the first real request arrives.
+    warmup_frame = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=np.zeros((480, 640, 3), dtype=np.uint8),
+    )
+    for _ in range(20):
+        lm.detect(warmup_frame)
     print("[startup] PoseLandmarker warmed up — ready for requests", flush=True)
 
 # ---------------------------------------------------------------------------

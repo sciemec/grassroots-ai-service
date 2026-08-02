@@ -283,7 +283,8 @@ def process_video_with_mediapipe(
     orig_fps     = cap.get(cv2.CAP_PROP_FPS) or 30.0
     sample_every = max(1, int(round(orig_fps / target_fps)))
     frame_measurements: list[dict] = []
-    frame_idx    = 0
+    frame_idx     = 0
+    first_sampled = True  # used for double-detect priming — see comment below
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -291,7 +292,17 @@ def process_video_with_mediapipe(
         if frame_idx % sample_every == 0:
             rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            # IMAGE mode: use detect() — no timestamp argument needed or allowed
+            # Double-detect on the first sampled frame: MediaPipe's internal
+            # landmark_projection_calculator initialises lazily on the first
+            # detect() call that finds a real human pose, and that initialisation
+            # disrupts the very call that triggers it (causing frames=1 on cold
+            # start, not enough to clear the >= 5 threshold). By running one
+            # silent detect() on the first frame before the counting call, we
+            # absorb the init cost without losing any counted frames — both calls
+            # use the same mp_img, so the frame itself is still counted.
+            if first_sampled:
+                landmarker.detect(mp_img)
+                first_sampled = False
             result = landmarker.detect(mp_img)
             if result.pose_world_landmarks:
                 m = measure_frame(result.pose_world_landmarks[0])

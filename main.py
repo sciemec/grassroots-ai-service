@@ -77,6 +77,14 @@ async def download_pose_model() -> None:
             "pose_landmarker_heavy.task"
         )
         urllib.request.urlretrieve(url, model_path)
+    # Warmup: initialise the PoseLandmarker singleton and run one blank
+    # detection so the TFLite XNNPACK kernel is fully JIT-compiled before
+    # the first real request arrives. Without this, the first request after
+    # a cold start returns frames=0 (422) because the model isn't ready.
+    lm = get_pose_landmarker()
+    blank = np.zeros((64, 64, 3), dtype=np.uint8)
+    lm.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=blank))
+    print("[startup] PoseLandmarker warmed up — ready for requests", flush=True)
 
 # ---------------------------------------------------------------------------
 # YOLOv8 — lazy loaded

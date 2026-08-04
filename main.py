@@ -1522,7 +1522,7 @@ async def track_ball_endpoint(
 # /track-ball-async — non-blocking version; returns job_id immediately
 # ---------------------------------------------------------------------------
 
-async def _run_ball_tracking_background(
+def _run_ball_tracking_background(
     job_id: str, tmp_path: str, home_team: str, away_team: str, squad_map: dict
 ) -> None:
     try:

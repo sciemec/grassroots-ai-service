@@ -1519,6 +1519,71 @@ async def track_ball_endpoint(
 
 
 # ---------------------------------------------------------------------------
+# /track-ball-async — non-blocking version; returns job_id immediately
+# ---------------------------------------------------------------------------
+
+async def _run_ball_tracking_background(
+    job_id: str, tmp_path: str, home_team: str, away_team: str, squad_map: dict
+) -> None:
+    try:
+        _jobs[job_id]["message"] = "Detecting ball & players…"
+        _jobs[job_id]["progress"] = 10
+        result = _run_ball_tracking(tmp_path, home_team, away_team, squad_map)
+        _jobs[job_id].update({
+            "status": "complete",
+            "progress": 100,
+            "message": "Analysis complete.",
+            "result": result,
+        })
+    except Exception as exc:
+        _jobs[job_id].update({"status": "failed", "error": str(exc), "progress": 0})
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+@app.post("/track-ball-async")
+async def track_ball_async(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    home_team: str = Form("Home"),
+    away_team: str = Form("Away"),
+    squad: Optional[str] = Form(None),
+) -> dict:
+    """
+    Non-blocking ball tracker. Saves video, fires background job, returns
+    {job_id} within 1 second. Frontend polls GET /job/{job_id} for status.
+    """
+    if file.content_type and not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="File must be a video")
+    squad_map: dict[str, str] = {}
+    if squad:
+        try:
+            squad_map = json.loads(squad)
+        except json.JSONDecodeError:
+            pass
+    suffix = os.path.splitext(file.filename or "clip.mp4")[1] or ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+    job_id = str(uuid_mod.uuid4())
+    _jobs[job_id] = {
+        "status": "processing",
+        "progress": 5,
+        "message": "Video received. Starting ball tracking…",
+        "result": None,
+        "error": None,
+        "created_at": time.time(),
+    }
+    background_tasks.add_task(
+        _run_ball_tracking_background, job_id, tmp_path, home_team, away_team, squad_map
+    )
+    return {"job_id": job_id}
+
+
+# ---------------------------------------------------------------------------
 # Sprint detection + FFmpeg clips
 # ---------------------------------------------------------------------------
 

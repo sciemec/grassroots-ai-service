@@ -1143,6 +1143,382 @@ def _run_tracking(video_path: str, squad_map: dict[str, str]) -> dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
+# /track-ball — ball-first tracking with pass map + heatmap outputs
+# Ball sampled at 5 fps; players at 1 fps (same as /track).
+# Adds: ball_events, player_positions (flat array), pass_events.
+# ---------------------------------------------------------------------------
+
+BALL_SAMPLE_FPS          = 5      # ball detection rate
+KICK_SPEED_KMH           = 10.0   # speed jump above this → kick
+STOPPED_SPEED_KMH        = 2.0    # speed below this after motion → stopped
+DEFLECT_COS_THRESHOLD    = 0.40   # direction-cosine below this while fast → deflection
+BALL_INTERP_MAX_GAP_S    = 5.0    # max gap (seconds) to fill with linear interpolation
+PASS_MAX_GAP_S           = 15.0   # max seconds between two kicks to count as a pass
+
+
+def _interpolate_ball(raw: list[dict]) -> list[dict]:
+    """Linear interpolation of ball positions across gaps up to BALL_INTERP_MAX_GAP_S."""
+    if not raw:
+        return []
+    out: list[dict] = []
+    for i, pos in enumerate(raw):
+        out.append({**pos, "interpolated": False})
+        if i < len(raw) - 1:
+            gap = raw[i + 1]["time_s"] - pos["time_s"]
+            if 0 < gap <= BALL_INTERP_MAX_GAP_S:
+                n_steps = int(round(gap * BALL_SAMPLE_FPS)) - 1
+                for s in range(1, n_steps + 1):
+                    t = s / (n_steps + 1)
+                    out.append({
+                        "time_s":      round(pos["time_s"] + gap * t, 3),
+                        "x":           round(pos["x"] + (raw[i+1]["x"] - pos["x"]) * t, 3),
+                        "y":           round(pos["y"] + (raw[i+1]["y"] - pos["y"]) * t, 3),
+                        "interpolated": True,
+                    })
+    return out
+
+
+def _detect_ball_events(positions: list[dict]) -> list[dict]:
+    """
+    Walk the ball position array and emit kick / deflection / stopped events.
+    positions: [{"time_s", "x", "y", "interpolated"}, ...]
+    """
+    events: list[dict] = []
+    n = len(positions)
+    if n < 3:
+        return events
+
+    # Pre-compute per-step speed (km/h) and normalised direction vector
+    speeds: list[float]            = []
+    dirs:   list[tuple[float, float]] = []
+    for i in range(1, n):
+        dt = positions[i]["time_s"] - positions[i-1]["time_s"]
+        if dt <= 0:
+            speeds.append(0.0); dirs.append((0.0, 0.0)); continue
+        dx = (positions[i]["x"] - positions[i-1]["x"]) * PITCH_LENGTH_M
+        dy = (positions[i]["y"] - positions[i-1]["y"]) * PITCH_WIDTH_M
+        dist_m     = (dx**2 + dy**2) ** 0.5
+        speed_kmh  = (dist_m / dt) * 3.6
+        mag        = max(dist_m, 1e-6)
+        speeds.append(round(speed_kmh, 1))
+        dirs.append((dx / mag, dy / mag))
+
+    in_motion       = False
+    last_event_idx  = -5  # prevent events that are too close together
+
+    for i in range(1, n - 1):
+        spd      = speeds[i - 1]
+        prev_spd = speeds[i - 2] if i >= 2 else 0.0
+        pos      = positions[i]
+        ev_type: str | None = None
+
+        # Direction change cosine between last two steps
+        d_cos: float | None = None
+        if i >= 2:
+            a, b = dirs[i-2], dirs[i-1]
+            d_cos = round(max(-1.0, min(1.0, a[0]*b[0] + a[1]*b[1])), 3)
+
+        if spd >= KICK_SPEED_KMH and prev_spd < KICK_SPEED_KMH:
+            ev_type = "kick"
+            in_motion = True
+        elif (
+            spd >= KICK_SPEED_KMH
+            and d_cos is not None and d_cos < DEFLECT_COS_THRESHOLD
+            and i - last_event_idx > 2
+        ):
+            ev_type = "deflection"
+        elif in_motion and spd < STOPPED_SPEED_KMH and i - last_event_idx > 3:
+            ev_type = "stopped"
+            in_motion = False
+
+        if ev_type and i - last_event_idx > 2:
+            events.append({
+                "type":          ev_type,
+                "frame":         i,
+                "time_s":        round(pos["time_s"], 2),
+                "x":             pos["x"],
+                "y":             pos["y"],
+                "speed_kmh":     spd,
+                "direction_cos": d_cos,
+            })
+            last_event_idx = i
+
+    return events
+
+
+def _build_pass_events(
+    kick_events: list[dict],
+    player_seconds: dict,
+    player_positions: dict,
+    player_teams: dict,
+    squad_map: dict,
+) -> list[dict]:
+    """
+    Attribute each kick to the nearest player at that moment.
+    Consecutive kicks attributed to different players → pass event.
+    """
+    attributed: list[dict] = []
+
+    for ev in kick_events:
+        ev_sec   = int(ev["time_s"])
+        best_id: int | None = None
+        best_dist = float("inf")
+
+        for tid, secs in player_seconds.items():
+            for j, s in enumerate(secs):
+                if abs(s - ev_sec) <= 1:
+                    pos = player_positions[tid][j]
+                    dx  = (pos[0] - ev["x"]) * PITCH_LENGTH_M
+                    dy  = (pos[1] - ev["y"]) * PITCH_WIDTH_M
+                    d   = (dx**2 + dy**2) ** 0.5
+                    if d < best_dist:
+                        best_dist = d
+                        best_id   = tid
+                    break  # only one entry per second per player
+
+        attributed.append({**ev, "player_id": best_id})
+
+    passes: list[dict] = []
+    for i in range(len(attributed) - 1):
+        a, b = attributed[i], attributed[i + 1]
+        if a["player_id"] is None or b["player_id"] is None:
+            continue
+        if a["player_id"] == b["player_id"]:
+            continue  # same player touched it twice → dribble, not a pass
+        if b["time_s"] - a["time_s"] > PASS_MAX_GAP_S:
+            continue  # gap too large to be a pass
+
+        from_id = int(a["player_id"])
+        to_id   = int(b["player_id"])
+        passes.append({
+            "from_player_id": from_id,
+            "to_player_id":   to_id,
+            "from_team":      player_teams.get(from_id, "home"),
+            "to_team":        player_teams.get(to_id, "home"),
+            "from_name":      squad_map.get(str(from_id), ""),
+            "to_name":        squad_map.get(str(to_id), ""),
+            "time_s":         round(a["time_s"], 2),
+            "from_x":         round(a["x"], 3),
+            "from_y":         round(a["y"], 3),
+            "to_x":           round(b["x"], 3),
+            "to_y":           round(b["y"], 3),
+        })
+
+    return passes
+
+
+def _run_ball_tracking(
+    video_path: str,
+    home_team: str,
+    away_team: str,
+    squad_map: dict[str, str],
+) -> dict[str, Any]:
+    model = get_model()
+    cap   = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise HTTPException(status_code=422, detail="Cannot open video file")
+
+    orig_fps     = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Sample intervals (frames between detections)
+    ball_every   = max(1, int(round(orig_fps / BALL_SAMPLE_FPS)))
+    player_every = max(1, int(round(orig_fps / SAMPLE_FPS)))
+
+    tracker = sv.ByteTracker(
+        track_activation_threshold=TRACKER_CONFIG.track_activation_threshold,
+        lost_track_buffer=TRACKER_CONFIG.lost_track_buffer,
+        minimum_matching_threshold=TRACKER_CONFIG.minimum_matching_threshold,
+        frame_rate=SAMPLE_FPS,
+        minimum_consecutive_frames=TRACKER_CONFIG.minimum_consecutive_frames,
+    )
+
+    player_positions: dict[int, list] = defaultdict(list)
+    player_seconds:   dict[int, list] = defaultdict(list)
+    player_teams:     dict[int, str]  = {}
+    color_memory:     dict[int, Any]  = {}
+    ball_raw:         list[dict]      = []
+    possession_frames = {"home": 0, "away": 0}
+    pitch_bounds      = None
+
+    frame_idx        = 0
+    player_second    = 0
+    ball_time_s      = 0.0
+    frames_processed = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        is_ball   = (frame_idx % ball_every   == 0)
+        is_player = (frame_idx % player_every == 0)
+
+        if is_ball or is_player:
+            # Detect pitch bounds from first 10 samples
+            if frames_processed < 10:
+                bounds = detect_pitch_bounds(frame)
+                pitch_bounds = (
+                    bounds if pitch_bounds is None
+                    else tuple(int(0.7*a + 0.3*b) for a, b in zip(pitch_bounds, bounds))
+                )
+            if pitch_bounds is None:
+                pitch_bounds = (0, 0, width, height)
+
+            results  = model(frame, classes=[PERSON_CLASS_ID, BALL_CLASS_ID], verbose=False)[0]
+            all_dets = sv.Detections.from_ultralytics(results)
+            if all_dets.class_id is not None and len(all_dets) > 0:
+                p_dets = all_dets[all_dets.class_id == PERSON_CLASS_ID]
+                b_dets = all_dets[all_dets.class_id == BALL_CLASS_ID]
+            else:
+                p_dets = all_dets; b_dets = sv.Detections.empty()
+
+            # Ball — 5 fps
+            if is_ball:
+                if len(b_dets) > 0:
+                    bi = int(np.argmax(b_dets.confidence)) if b_dets.confidence is not None else 0
+                    bx1, by1, bx2, by2 = b_dets.xyxy[bi]
+                    bx, by = pixel_to_pitch((bx1+bx2)/2, (by1+by2)/2, pitch_bounds)
+                    ball_raw.append({"time_s": round(ball_time_s, 3), "x": round(bx, 3), "y": round(by, 3)})
+                ball_time_s += 1.0 / BALL_SAMPLE_FPS
+
+            # Players — 1 fps
+            if is_player:
+                p_dets = tracker.update_with_detections(p_dets)
+                if len(p_dets) > 0 and p_dets.tracker_id is not None:
+                    team_map  = classify_teams(p_dets.tracker_id, p_dets.xyxy, frame, color_memory)
+                    ball_ref  = ball_raw[-1] if ball_raw else None
+                    min_dist  = float("inf"); closest_team = "home"
+
+                    for tid, box in zip(p_dets.tracker_id, p_dets.xyxy):
+                        px = (box[0]+box[2]) / 2.0; py = box[3]
+                        xn, yn = pixel_to_pitch(px, py, pitch_bounds)
+                        player_positions[int(tid)].append((xn, yn))
+                        player_seconds[int(tid)].append(player_second)
+                        player_teams[int(tid)] = team_map.get(int(tid), "home")
+                        if ball_ref:
+                            d = ((xn - ball_ref["x"])**2 + (yn - ball_ref["y"])**2) ** 0.5
+                            if d < min_dist:
+                                min_dist = d; closest_team = team_map.get(int(tid), "home")
+
+                    if ball_ref and min_dist < float("inf"):
+                        possession_frames[closest_team] += 1
+
+                player_second    += 1
+                frames_processed += 1
+
+        frame_idx += 1
+
+    cap.release()
+
+    # Build ball outputs
+    ball_interp  = _interpolate_ball(ball_raw)
+    ball_events  = _detect_ball_events(ball_interp if ball_interp else ball_raw)
+    kick_events  = [ev for ev in ball_events if ev["type"] == "kick"]
+    pass_events  = _build_pass_events(kick_events, player_seconds, player_positions, player_teams, squad_map)
+
+    # Build player outputs — aggregate stats + flat position track for heatmaps
+    players_out:      list[dict] = []
+    player_pos_flat:  list[dict] = []
+
+    for tid, positions in player_positions.items():
+        if len(positions) < 3:
+            continue
+        secs   = player_seconds[tid]
+        speeds = calculate_speeds(positions)
+        players_out.append({
+            "id":            tid,
+            "team":          player_teams.get(tid, "home"),
+            "jersey":        str(tid),
+            "name":          squad_map.get(str(tid), ""),
+            "top_speed_kmh": round(max(speeds), 1) if speeds else 0.0,
+            "avg_speed_kmh": round(sum(speeds)/len(speeds), 1) if speeds else 0.0,
+            "distance_m":    calculate_distance_m(positions),
+            "sprint_count":  sum(1 for s in speeds if s >= SPRINT_THRESHOLD_KMH),
+        })
+        for s, (xn, yn) in zip(secs, positions):
+            player_pos_flat.append({
+                "player_id": tid,
+                "second":    s,
+                "x":         round(xn, 3),
+                "y":         round(yn, 3),
+                "team":      player_teams.get(tid, "home"),
+            })
+
+    total_poss  = possession_frames["home"] + possession_frames["away"]
+    poss_home   = round(possession_frames["home"] / total_poss * 100) if total_poss > 0 else 50
+    interp_cnt  = sum(1 for p in ball_interp if p.get("interpolated"))
+    home_cnt    = sum(1 for p in players_out if p["team"] == "home")
+
+    return {
+        "players":          players_out,
+        "ball":             ball_interp,
+        "ball_events":      ball_events,
+        "player_positions": player_pos_flat,
+        "pass_events":      pass_events,
+        "stats": {
+            "home_possession":          poss_home,
+            "away_possession":          100 - poss_home,
+            "duration_s":               player_second,
+            "ball_detected_frames":     len(ball_raw),
+            "ball_interpolated_frames": interp_cnt,
+            "ball_events_detected":     len(ball_events),
+            "ball_sample_fps":          BALL_SAMPLE_FPS,
+            "total_players":            len(players_out),
+            "home_players":             home_cnt,
+            "away_players":             len(players_out) - home_cnt,
+        },
+        "video": {
+            "fps":          round(orig_fps, 2),
+            "total_frames": total_frames,
+            "duration_s":   round(total_frames / orig_fps, 1),
+        },
+    }
+
+
+@app.post("/track-ball")
+async def track_ball_endpoint(
+    file: UploadFile = File(...),
+    home_team: str = Form("Home"),
+    away_team: str = Form("Away"),
+    squad: Optional[str] = Form(None),
+) -> dict[str, Any]:
+    """
+    Ball-first match tracker.
+
+    Ball detected at 5 fps → smooth path, kick/deflection/stopped events.
+    Players detected at 1 fps → aggregate stats, per-second position track.
+
+    Returns:
+      players          — aggregate stats per tracked player
+      ball             — interpolated ball path at 5 fps
+      ball_events      — kick / deflection / stopped events with x,y,time_s
+      player_positions — flat array of {player_id, second, x, y, team}
+                         consumed by the Heatmaps analyst tool
+      pass_events      — {from_player_id, to_player_id, time_s, from_x/y, to_x/y}
+                         consumed by the Pass Map analyst tool
+      stats            — possession, duration, counts
+      video            — fps, total_frames, duration_s
+    """
+    if file.content_type and not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="File must be a video")
+    squad_map: dict[str, str] = {}
+    if squad:
+        try: squad_map = json.loads(squad)
+        except json.JSONDecodeError: pass
+    suffix = os.path.splitext(file.filename or "clip.mp4")[1] or ".mp4"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(await file.read()); tmp_path = tmp.name
+    try:
+        return _run_ball_tracking(tmp_path, home_team, away_team, squad_map)
+    finally:
+        try: os.unlink(tmp_path)
+        except OSError: pass
+
+
+# ---------------------------------------------------------------------------
 # Sprint detection + FFmpeg clips
 # ---------------------------------------------------------------------------
 

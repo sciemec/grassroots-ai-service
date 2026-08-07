@@ -974,6 +974,88 @@ def classify_teams(tracker_ids, boxes, frame, color_memory):
     id_to_team = {tid: cluster_to_team.get(label, "home") for tid, label in zip(ids, labels)}
     return {tid: id_to_team.get(tid, "home") for tid in tracker_ids}
 
+# ── supervised colour helpers ─────────────────────────────────────────────────
+
+def _hex_to_lab(hex_str: str) -> np.ndarray:
+    """Convert '#RRGGBB' to a CIE-Lab colour vector (float32)."""
+    hex_str = hex_str.lstrip("#")
+    r, g, b = int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16)
+    bgr = np.uint8([[[b, g, r]]])
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2Lab)
+    return lab[0, 0].astype(np.float32)
+
+
+def extract_jersey_color_lab(frame: np.ndarray, box: np.ndarray) -> np.ndarray:
+    """Extract dominant jersey colour in CIE-Lab from the player's chest region.
+    Crop: inner 50 % of box width (avoids arms/background), 20–55 % of height
+    (chest only — avoids head and shorts).
+    """
+    x1, y1, x2, y2 = map(int, box)
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(frame.shape[1], x2); y2 = min(frame.shape[0], y2)
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros(3, dtype=np.float32)
+    bw = x2 - x1; bh = y2 - y1
+    cx1 = x1 + int(bw * 0.25); cx2 = x1 + int(bw * 0.75)
+    cy1 = y1 + int(bh * 0.20); cy2 = y1 + int(bh * 0.55)
+    crop = frame[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return np.zeros(3, dtype=np.float32)
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2Lab)
+    pixels = lab.reshape(-1, 3).astype(np.float32)
+    if len(pixels) < 4:
+        return pixels.mean(axis=0)
+    km = KMeans(n_clusters=1, n_init=3, random_state=42)
+    km.fit(pixels)
+    return km.cluster_centers_[0]
+
+
+def classify_teams_supervised(
+    tracker_ids,
+    boxes,
+    frame: np.ndarray,
+    color_memory: dict,
+    team_colors_lab: dict[str, np.ndarray],
+) -> dict:
+    """Assign each tracked player to home / away / home_gk / away_gk / referee
+    by nearest CIE-Lab distance to the five user-supplied reference colours.
+    EMA smoothing reduces per-frame noise.  Players assigned 'referee' are
+    excluded from home/away stats by downstream consumers — matching the
+    existing unsupervised behaviour.
+    """
+    team_names = list(team_colors_lab.keys())
+    ref_colors = np.array(list(team_colors_lab.values()), dtype=np.float32)
+    labels_out: dict[int, str] = {}
+
+    for tid, box in zip(tracker_ids, boxes):
+        color = extract_jersey_color_lab(frame, box)
+        if tid not in color_memory:
+            color_memory[tid] = color
+        else:
+            color_memory[tid] = 0.8 * color_memory[tid] + 0.2 * color
+        dists = np.linalg.norm(ref_colors - color_memory[tid], axis=1)
+        labels_out[int(tid)] = team_names[int(np.argmin(dists))]
+
+    return {int(tid): labels_out.get(int(tid), "home") for tid in tracker_ids}
+
+
+def _parse_team_colors(team_colors_json: Optional[str]) -> Optional[dict[str, np.ndarray]]:
+    """Parse a JSON string like
+      '{"home":"#ff0000","away":"#0000ff","home_gk":"#ffff00",
+        "away_gk":"#00ffff","referee":"#000000"}'
+    into a dict of Lab arrays. Returns None if the input is missing or invalid."""
+    if not team_colors_json:
+        return None
+    try:
+        raw: dict[str, str] = json.loads(team_colors_json)
+        required = {"home", "away", "home_gk", "away_gk", "referee"}
+        if not required.issubset(raw.keys()):
+            return None
+        return {k: _hex_to_lab(v) for k, v in raw.items() if k in required}
+    except Exception:
+        return None
+
+
 def detect_pitch_bounds(frame):
     hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     lower = np.array([30, 40, 40]); upper = np.array([90, 255, 255])
@@ -1025,6 +1107,7 @@ def calculate_speeds(positions):
 async def track_video(
     file: UploadFile = File(...),
     squad: Optional[str] = Form(None),
+    team_colors: Optional[str] = Form(None),
 ) -> dict[str, Any]:
     if file.content_type and not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video")
@@ -1032,16 +1115,21 @@ async def track_video(
     if squad:
         try: squad_map = json.loads(squad)
         except json.JSONDecodeError: pass
+    team_colors_lab = _parse_team_colors(team_colors)
     suffix = os.path.splitext(file.filename or "match.mp4")[1] or ".mp4"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(await file.read()); tmp_path = tmp.name
     try:
-        return _run_tracking(tmp_path, squad_map)
+        return _run_tracking(tmp_path, squad_map, team_colors_lab)
     finally:
         try: os.unlink(tmp_path)
         except OSError: pass
 
-def _run_tracking(video_path: str, squad_map: dict[str, str]) -> dict[str, Any]:
+def _run_tracking(
+    video_path: str,
+    squad_map: dict[str, str],
+    team_colors_lab: Optional[dict[str, np.ndarray]] = None,
+) -> dict[str, Any]:
     model = get_model()
     cap   = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1094,7 +1182,11 @@ def _run_tracking(video_path: str, squad_map: dict[str, str]) -> dict[str, Any]:
                 ball_positions.append({"second": second, "x": round(bx_norm,3), "y": round(by_norm,3)})
             if len(player_detections) > 0 and player_detections.tracker_id is not None:
                 tracker_ids = player_detections.tracker_id; boxes = player_detections.xyxy
-                team_map    = classify_teams(tracker_ids, boxes, frame, color_memory)
+                team_map = (
+                    classify_teams_supervised(tracker_ids, boxes, frame, color_memory, team_colors_lab)
+                    if team_colors_lab else
+                    classify_teams(tracker_ids, boxes, frame, color_memory)
+                )
                 for tid, box in zip(tracker_ids, boxes):
                     px = (box[0]+box[2])/2.0; py = box[3]
                     x_norm, y_norm = pixel_to_pitch(px, py, pitch_bounds)
@@ -1312,6 +1404,7 @@ def _run_ball_tracking(
     home_team: str,
     away_team: str,
     squad_map: dict[str, str],
+    team_colors_lab: Optional[dict[str, np.ndarray]] = None,
 ) -> dict[str, Any]:
     model = get_model()
     cap   = cv2.VideoCapture(video_path)
@@ -1388,7 +1481,11 @@ def _run_ball_tracking(
             if is_player:
                 p_dets = tracker.update_with_detections(p_dets)
                 if len(p_dets) > 0 and p_dets.tracker_id is not None:
-                    team_map  = classify_teams(p_dets.tracker_id, p_dets.xyxy, frame, color_memory)
+                    team_map = (
+                        classify_teams_supervised(p_dets.tracker_id, p_dets.xyxy, frame, color_memory, team_colors_lab)
+                        if team_colors_lab else
+                        classify_teams(p_dets.tracker_id, p_dets.xyxy, frame, color_memory)
+                    )
                     ball_ref  = ball_raw[-1] if ball_raw else None
                     min_dist  = float("inf"); closest_team = "home"
 
@@ -1484,6 +1581,7 @@ async def track_ball_endpoint(
     home_team: str = Form("Home"),
     away_team: str = Form("Away"),
     squad: Optional[str] = Form(None),
+    team_colors: Optional[str] = Form(None),
 ) -> dict[str, Any]:
     """
     Ball-first match tracker.
@@ -1491,16 +1589,10 @@ async def track_ball_endpoint(
     Ball detected at 5 fps → smooth path, kick/deflection/stopped events.
     Players detected at 1 fps → aggregate stats, per-second position track.
 
-    Returns:
-      players          — aggregate stats per tracked player
-      ball             — interpolated ball path at 5 fps
-      ball_events      — kick / deflection / stopped events with x,y,time_s
-      player_positions — flat array of {player_id, second, x, y, team}
-                         consumed by the Heatmaps analyst tool
-      pass_events      — {from_player_id, to_player_id, time_s, from_x/y, to_x/y}
-                         consumed by the Pass Map analyst tool
-      stats            — possession, duration, counts
-      video            — fps, total_frames, duration_s
+    Accepts optional team_colors JSON:
+      {"home":"#hex","away":"#hex","home_gk":"#hex","away_gk":"#hex","referee":"#hex"}
+    When provided, uses Lab-distance supervised classification instead of
+    unsupervised KMeans. Referees are excluded from home/away stats either way.
     """
     if file.content_type and not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video")
@@ -1508,11 +1600,12 @@ async def track_ball_endpoint(
     if squad:
         try: squad_map = json.loads(squad)
         except json.JSONDecodeError: pass
+    team_colors_lab = _parse_team_colors(team_colors)
     suffix = os.path.splitext(file.filename or "clip.mp4")[1] or ".mp4"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(await file.read()); tmp_path = tmp.name
     try:
-        return _run_ball_tracking(tmp_path, home_team, away_team, squad_map)
+        return _run_ball_tracking(tmp_path, home_team, away_team, squad_map, team_colors_lab)
     finally:
         try: os.unlink(tmp_path)
         except OSError: pass
@@ -1523,12 +1616,13 @@ async def track_ball_endpoint(
 # ---------------------------------------------------------------------------
 
 def _run_ball_tracking_background(
-    job_id: str, tmp_path: str, home_team: str, away_team: str, squad_map: dict
+    job_id: str, tmp_path: str, home_team: str, away_team: str, squad_map: dict,
+    team_colors_lab: Optional[dict] = None,
 ) -> None:
     try:
         _jobs[job_id]["message"] = "Detecting ball & players…"
         _jobs[job_id]["progress"] = 10
-        result = _run_ball_tracking(tmp_path, home_team, away_team, squad_map)
+        result = _run_ball_tracking(tmp_path, home_team, away_team, squad_map, team_colors_lab)
         _jobs[job_id].update({
             "status": "complete",
             "progress": 100,
@@ -1551,10 +1645,12 @@ async def track_ball_async(
     home_team: str = Form("Home"),
     away_team: str = Form("Away"),
     squad: Optional[str] = Form(None),
+    team_colors: Optional[str] = Form(None),
 ) -> dict:
     """
     Non-blocking ball tracker. Saves video, fires background job, returns
     {job_id} within 1 second. Frontend polls GET /job/{job_id} for status.
+    Accepts optional team_colors JSON for supervised kit-colour classification.
     """
     if file.content_type and not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video")
@@ -1564,6 +1660,7 @@ async def track_ball_async(
             squad_map = json.loads(squad)
         except json.JSONDecodeError:
             pass
+    team_colors_lab = _parse_team_colors(team_colors)
     suffix = os.path.splitext(file.filename or "clip.mp4")[1] or ".mp4"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(await file.read())
@@ -1578,7 +1675,7 @@ async def track_ball_async(
         "created_at": time.time(),
     }
     background_tasks.add_task(
-        _run_ball_tracking_background, job_id, tmp_path, home_team, away_team, squad_map
+        _run_ball_tracking_background, job_id, tmp_path, home_team, away_team, squad_map, team_colors_lab
     )
     return {"job_id": job_id}
 
@@ -1813,7 +1910,7 @@ async def _analyse_background(job_id, req):
         )
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0,read=600.0,write=30.0,pool=10.0)) as client:
             gemini_res = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={google_key}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={google_key}",
                 headers={"Content-Type":"application/json"},
                 json={"contents":[{"parts":[{"text":system_prompt},{"file_data":{"mime_type":req.mimeType,"file_uri":req.fileUri}},{"text":"Provide your complete JSON analysis."}]}],
                     "generationConfig":{"temperature":0.2,"maxOutputTokens":4096}})
@@ -2378,7 +2475,7 @@ Score each touch 1-10:
 1-3 = Heavy touch, ball lost or major recovery needed"""
 
         gemini_res = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={google_key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={google_key}",
             headers={"Content-Type": "application/json"},
             json={"contents": [{"parts": [
                 {"text": prompt},
@@ -2672,7 +2769,7 @@ Return ONLY valid JSON:
 Be specific and technical. Reference exact body positions you observe."""
 
         gemini_res = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={google_key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={google_key}",
             headers={"Content-Type": "application/json"},
             json={"contents": [{"parts": [
                 {"text": prompt},

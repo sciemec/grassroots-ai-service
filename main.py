@@ -10,6 +10,7 @@ POST /clip            — match video → sprint highlight clips → R2
 POST /process-video   — background pipeline (download R2 → track → clip → callback)
 POST /gemini-upload   — proxy video upload to Gemini File API (CORS bypass)
 POST /generate-thumbnail — extract frame at 3s → upload JPEG to R2
+POST /yolo/detect     — lightweight YOLOv8 detection on a Gemini-hosted video (10-frame sample)
 GET  /job/{job_id}    — poll background analysis job status
 GET  /health          — liveness check
 """
@@ -2002,6 +2003,154 @@ async def generate_thumbnail(req: GenerateThumbnailRequest) -> dict[str, str]:
             if path:
                 try: os.unlink(path)
                 except OSError: pass
+
+# ---------------------------------------------------------------------------
+# POST /yolo/detect — lightweight YOLO detection on a Gemini-hosted video
+# ---------------------------------------------------------------------------
+
+class YoloDetectRequest(BaseModel):
+    file_uri: str
+    file_name: str
+    jersey: str = ""
+    gemini_key: str
+
+
+@app.post("/yolo/detect")
+async def yolo_detect(req: YoloDetectRequest) -> dict[str, Any]:
+    """
+    Accepts a Gemini Files API reference and runs lightweight YOLOv8 detection
+    on up to 10 sampled frames.  Returns player count, ball visibility, and
+    player distribution across pitch thirds.
+
+    Designed to complete within the 15-second timeout set by the Next.js caller.
+    On any failure the route returns null-safe values so the caller can skip
+    YOLO enrichment gracefully.
+
+    Note: target_jersey_visible is always null — standard YOLOv8 does not read
+    jersey numbers.  A dedicated OCR model would be required for that feature.
+    """
+    tmp_path: str | None = None
+    cap = None
+    try:
+        model = get_model()
+
+        # Try to stream directly from Gemini Files API via cv2/FFmpeg.
+        # This avoids downloading the full file — cv2 only fetches the frames
+        # we seek to, which keeps latency well under the 15-second budget.
+        stream_url = (
+            f"https://generativelanguage.googleapis.com/v1beta/{req.file_name}"
+            f"?alt=media&key={req.gemini_key}"
+        )
+        cap = cv2.VideoCapture(stream_url)
+
+        # Fallback: download the file (capped at 150 MB) if streaming fails.
+        if not cap.isOpened():
+            cap = None
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=5.0)
+            ) as client:
+                head_res = await client.head(stream_url)
+                content_length = int(head_res.headers.get("content-length", 0))
+                if content_length > 150 * 1024 * 1024:
+                    return {
+                        "player_count": None, "ball_detected": None,
+                        "target_jersey_visible": None, "field_zones": {},
+                    }
+                dl_res = await client.get(stream_url)
+                if not dl_res.is_success:
+                    return {
+                        "player_count": None, "ball_detected": None,
+                        "target_jersey_visible": None, "field_zones": {},
+                    }
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                    f.write(dl_res.content)
+                    tmp_path = f.name
+            cap = cv2.VideoCapture(tmp_path)
+
+        if not cap.isOpened():
+            return {
+                "player_count": None, "ball_detected": None,
+                "target_jersey_visible": None, "field_zones": {},
+            }
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 300
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+
+        # Sample up to 10 evenly spaced frames across the video.
+        MAX_SAMPLE = 10
+        step = max(1, total_frames // MAX_SAMPLE)
+        sample_indices = list(range(0, total_frames, step))[:MAX_SAMPLE]
+
+        player_counts: list[int] = []
+        ball_seen = False
+        zones: dict[str, int] = {
+            "defensive_third": 0,
+            "middle_third":    0,
+            "attacking_third": 0,
+        }
+
+        for idx in sample_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            results = model(frame, classes=[PERSON_CLASS_ID, BALL_CLASS_ID], verbose=False)[0]
+            dets = sv.Detections.from_ultralytics(results)
+
+            if dets.class_id is None or len(dets) == 0:
+                player_counts.append(0)
+                continue
+
+            person_dets = dets[dets.class_id == PERSON_CLASS_ID]
+            ball_dets   = dets[dets.class_id == BALL_CLASS_ID]
+
+            player_counts.append(len(person_dets))
+            if len(ball_dets) > 0:
+                ball_seen = True
+
+            # Classify each detected player into a vertical pitch third.
+            # This is camera-angle-agnostic and good enough for prompt enrichment.
+            for box in person_dets.xyxy:
+                cy = (box[1] + box[3]) / 2.0
+                rel_y = cy / frame_height
+                if rel_y < 0.33:
+                    zones["defensive_third"] += 1
+                elif rel_y < 0.67:
+                    zones["middle_third"] += 1
+                else:
+                    zones["attacking_third"] += 1
+
+        player_count = (
+            int(round(sum(player_counts) / len(player_counts)))
+            if player_counts else 0
+        )
+
+        return {
+            "player_count":          player_count,
+            "ball_detected":         ball_seen,
+            "target_jersey_visible": None,   # YOLOv8 does not read jersey numbers
+            "field_zones":           zones,
+        }
+
+    except Exception:
+        # Never crash the caller — YOLO enrichment is always optional.
+        return {
+            "player_count":          None,
+            "ball_detected":         None,
+            "target_jersey_visible": None,
+            "field_zones":           {},
+        }
+
+    finally:
+        if cap is not None:
+            cap.release()
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # Health check

@@ -64,6 +64,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Gemini model — override via GEMINI_MODEL env var on Render if needed
+_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+
 # ---------------------------------------------------------------------------
 # Startup — download MediaPipe model once
 # ---------------------------------------------------------------------------
@@ -1911,7 +1914,7 @@ async def _analyse_background(job_id, req):
         )
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0,read=600.0,write=30.0,pool=10.0)) as client:
             gemini_res = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={google_key}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent?key={google_key}",
                 headers={"Content-Type":"application/json"},
                 json={"contents":[{"parts":[{"text":system_prompt},{"file_data":{"mime_type":req.mimeType,"file_uri":req.fileUri}},{"text":"Provide your complete JSON analysis."}]}],
                     "generationConfig":{"temperature":0.2,"maxOutputTokens":4096}})
@@ -2624,7 +2627,7 @@ Score each touch 1-10:
 1-3 = Heavy touch, ball lost or major recovery needed"""
 
         gemini_res = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={google_key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent?key={google_key}",
             headers={"Content-Type": "application/json"},
             json={"contents": [{"parts": [
                 {"text": prompt},
@@ -2918,7 +2921,7 @@ Return ONLY valid JSON:
 Be specific and technical. Reference exact body positions you observe."""
 
         gemini_res = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={google_key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent?key={google_key}",
             headers={"Content-Type": "application/json"},
             json={"contents": [{"parts": [
                 {"text": prompt},

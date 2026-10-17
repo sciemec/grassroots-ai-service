@@ -65,7 +65,7 @@ app.add_middleware(
 )
 
 # Gemini model — override via GEMINI_MODEL env var on Render if needed
-_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 # ---------------------------------------------------------------------------
 # Startup — download MediaPipe model once
@@ -96,6 +96,7 @@ async def download_pose_model() -> None:
     for _ in range(20):
         lm.detect(warmup_frame)
     print("[startup] PoseLandmarker warmed up — ready for requests", flush=True)
+    print(f"[startup] Gemini model in use: {_GEMINI_MODEL}", flush=True)
 
 # ---------------------------------------------------------------------------
 # YOLOv8 — lazy loaded
@@ -1917,7 +1918,7 @@ async def _analyse_background(job_id, req):
                 f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent?key={google_key}",
                 headers={"Content-Type":"application/json"},
                 json={"contents":[{"parts":[{"text":system_prompt},{"file_data":{"mime_type":req.mimeType,"file_uri":req.fileUri}},{"text":"Provide your complete JSON analysis."}]}],
-                    "generationConfig":{"temperature":0.2,"maxOutputTokens":4096}})
+                    "generationConfig":{"maxOutputTokens":4096,"thinkingConfig":{"thinkingBudget":1024}}})
         _jobs[job_id]["progress"] = 75
         if not gemini_res.is_success:
             raise RuntimeError(f"Gemini API error: {gemini_res.status_code}")
@@ -2633,7 +2634,7 @@ Score each touch 1-10:
                 {"text": prompt},
                 {"file_data": {"mime_type": mime_type, "file_uri": file_uri}},
                 {"text": "Provide your complete JSON analysis of all touches in this video."}
-            ]}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2000}},
+            ]}], "generationConfig": {"maxOutputTokens": 2000, "thinkingConfig": {"thinkingBudget": 1024}}},
         )
 
     if not gemini_res.is_success:
@@ -2927,7 +2928,7 @@ Be specific and technical. Reference exact body positions you observe."""
                 {"text": prompt},
                 {"file_data": {"mime_type": mime_type, "file_uri": file_uri}},
                 {"text": "Provide your complete JSON technical analysis."}
-            ]}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2000}},
+            ]}], "generationConfig": {"maxOutputTokens": 2000, "thinkingConfig": {"thinkingBudget": 1024}}},
         )
 
     if not gemini_res.is_success:
